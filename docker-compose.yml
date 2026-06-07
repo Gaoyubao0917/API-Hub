@@ -1,10 +1,13 @@
 services:
   api-hub:
+    build:
+      context: .
+      dockerfile: Dockerfile
     image: api-hub:latest
     container_name: api-hub
     restart: unless-stopped
     ports:
-      - "3127:3127"
+      - "${PORT:-3127}:3127"
     volumes:
       - ./data:/app/data
     environment:
@@ -12,10 +15,12 @@ services:
       - HOST=0.0.0.0
       - PORT=3127
       - DATA_DIR=/app/data
-      - PANEL_PASSWORD=change-me
-      - SESSION_SECRET=change-this-random-long-secret
-      - LOGIN_MAX_ATTEMPTS=5
-      - LOGIN_LOCK_MINUTES=10
+      - PANEL_PASSWORD=${PANEL_PASSWORD:?Set PANEL_PASSWORD in .env before starting}
+      - SESSION_SECRET=${SESSION_SECRET:?Set SESSION_SECRET in .env before starting}
+      - LOGIN_MAX_ATTEMPTS=${LOGIN_MAX_ATTEMPTS:-5}
+      - LOGIN_LOCK_MINUTES=${LOGIN_LOCK_MINUTES:-10}
+      - JSON_BODY_LIMIT=${JSON_BODY_LIMIT:-50mb}
+      - UPLOAD_BODY_LIMIT=${UPLOAD_BODY_LIMIT:-200mb}
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://127.0.0.1:3127/healthz"]
       interval: 30s

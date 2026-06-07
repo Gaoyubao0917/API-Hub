@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
@@ -37,7 +38,10 @@ async function startServer(name, extraEnv = {}) {
   });
   child.stderr.setEncoding("utf8");
   child.stdout.setEncoding("utf8");
-  await waitForHealth(port, child);
+  let output = "";
+  child.stdout.on("data", (chunk) => { output += chunk; });
+  child.stderr.on("data", (chunk) => { output += chunk; });
+  await waitForHealth(port, child, () => output);
   return {
     port,
     dataDir,
@@ -51,12 +55,12 @@ async function startServer(name, extraEnv = {}) {
   };
 }
 
-async function waitForHealth(port, child) {
+async function waitForHealth(port, child, getOutput) {
   const deadline = Date.now() + 5000;
   let lastError = "";
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
-      throw new Error(`服务提前退出，code=${child.exitCode}`);
+      throw new Error(`服务提前退出，code=${child.exitCode}\n${getOutput()}`);
     }
     try {
       const response = await fetch(`http://127.0.0.1:${port}/healthz`);
@@ -178,9 +182,160 @@ async function testStoreRecovery() {
   fs.rmSync(dataDir, { recursive: true, force: true });
 }
 
+async function testMultipartFilePassthrough() {
+  let captured;
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      captured = {
+        method: req.method,
+        url: req.url,
+        authorization: req.headers.authorization,
+        contentType: req.headers["content-type"],
+        body: Buffer.concat(chunks).toString("utf8")
+      };
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ id: "file-smoke", object: "file" }));
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  const address = upstream.address();
+  assert.ok(address && typeof address === "object");
+
+  const server = await startServer("multipart");
+  try {
+    const provider = await jsonFetch(server.port, "/api/providers", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "mock",
+        type: "openai-compatible",
+        baseUrl: `http://127.0.0.1:${address.port}/v1`,
+        apiKey: "upstream-key",
+        priority: 1
+      })
+    });
+    assert.equal(provider.response.status, 201);
+
+    const clientKey = await jsonFetch(server.port, "/api/client-keys", {
+      method: "POST",
+      body: JSON.stringify({ label: "files" })
+    });
+    assert.equal(clientKey.response.status, 201);
+
+    const form = new FormData();
+    form.append("purpose", "assistants");
+    form.append("file", new Blob(["hello file"], { type: "text/plain" }), "hello.txt");
+    const upload = await fetch(`http://127.0.0.1:${server.port}/v1/files`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${clientKey.body.value}` },
+      body: form
+    });
+    assert.equal(upload.status, 200);
+    const body = await upload.json();
+    assert.equal(body.id, "file-smoke");
+    assert.equal(captured.method, "POST");
+    assert.equal(captured.url, "/v1/files");
+    assert.equal(captured.authorization, "Bearer upstream-key");
+    assert.match(captured.contentType, /^multipart\/form-data; boundary=/);
+    assert.match(captured.body, /name="purpose"/);
+    assert.match(captured.body, /hello file/);
+  } finally {
+    await server.stop();
+    await new Promise((resolve) => upstream.close(resolve));
+  }
+}
+
+async function testCapabilities() {
+  const server = await startServer("capabilities");
+  try {
+    const provider = await jsonFetch(server.port, "/api/providers", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "vision-only",
+        type: "openai-compatible",
+        baseUrl: "http://127.0.0.1:59999/v1",
+        apiKey: "upstream-key"
+      })
+    });
+    assert.equal(provider.response.status, 201);
+    const keyId = provider.body.apiKeys[0].id;
+    const route = await jsonFetch(server.port, "/api/routes", {
+      method: "POST",
+      body: JSON.stringify({
+        alias: "vision-model",
+        upstreamModel: "real-vision-model",
+        providerId: provider.body.id,
+        keyId
+      })
+    });
+    assert.equal(route.response.status, 201);
+    const setting = await jsonFetch(server.port, "/api/model-settings/vision-model", {
+      method: "PUT",
+      body: JSON.stringify({ strategy: "fixed", routeId: route.body.id, capabilities: ["chat", "vision"] })
+    });
+    assert.equal(setting.response.status, 200);
+    const clientKey = await jsonFetch(server.port, "/api/client-keys", {
+      method: "POST",
+      body: JSON.stringify({ label: "capability-client" })
+    });
+    const models = await jsonFetch(server.port, "/v1/models", {
+      headers: { authorization: `Bearer ${clientKey.body.value}` }
+    });
+    const model = models.body.data.find((item) => item.id === "vision-model");
+    assert.deepEqual(model.capabilities, ["chat", "vision"]);
+  } finally {
+    await server.stop();
+  }
+}
+
+async function testDeleteAggregateModel() {
+  const server = await startServer("delete-model");
+  try {
+    const provider = await jsonFetch(server.port, "/api/providers", {
+      method: "POST",
+      body: JSON.stringify({
+        name: "delete-provider",
+        type: "openai-compatible",
+        baseUrl: "http://127.0.0.1:59998/v1",
+        apiKey: "upstream-key"
+      })
+    });
+    const keyId = provider.body.apiKeys[0].id;
+    for (const upstreamModel of ["model-a", "model-b"]) {
+      const route = await jsonFetch(server.port, "/api/routes", {
+        method: "POST",
+        body: JSON.stringify({
+          alias: "delete-me",
+          upstreamModel,
+          providerId: provider.body.id,
+          keyId
+        })
+      });
+      assert.equal(route.response.status, 201);
+    }
+    const setting = await jsonFetch(server.port, "/api/model-settings/delete-me", {
+      method: "PUT",
+      body: JSON.stringify({ strategy: "random", capabilities: ["chat", "vision"] })
+    });
+    assert.equal(setting.response.status, 200);
+    const deleted = await jsonFetch(server.port, "/api/models/delete-me", { method: "DELETE" });
+    assert.equal(deleted.response.status, 200);
+    assert.equal(deleted.body.deleted, 2);
+    const state = await jsonFetch(server.port, "/api/state");
+    assert.equal(state.body.routes.some((route) => route.alias === "delete-me"), false);
+    assert.equal(state.body.modelSettings.some((item) => item.alias === "delete-me"), false);
+  } finally {
+    await server.stop();
+  }
+}
+
 await testBasicStartup();
 await testPanelPasswordAndClientKey();
 await testAdminToken();
 await testStoreRecovery();
+await testMultipartFilePassthrough();
+await testCapabilities();
+await testDeleteAggregateModel();
 
 console.log("smoke tests passed");

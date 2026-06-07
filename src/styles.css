@@ -226,11 +226,16 @@ code {
   padding: 10px;
 }
 
-.aggregateItem div:first-child {
+.aggregateItem > div:first-child {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+}
+
+.aggregateItem > div:first-child > strong {
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .candidateList {
@@ -532,13 +537,22 @@ code {
   margin-bottom: 10px;
 }
 
-.dashboardSummary div {
+.metricTile {
   display: grid;
-  gap: 4px;
+  grid-template-columns: minmax(90px, 0.8fr) minmax(120px, 1.2fr);
+  align-items: center;
+  gap: 10px;
+  min-height: 92px;
   border: 1px solid #d9e0e8;
   border-radius: 8px;
   background: #f8fafc;
   padding: 8px 10px;
+}
+
+.metricMeta {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
 }
 
 .dashboardSummary span {
@@ -548,6 +562,109 @@ code {
 
 .dashboardSummary strong {
   font-size: 18px;
+}
+
+.metricMeta em {
+  color: #7c8794;
+  font-size: 11px;
+  font-style: normal;
+}
+
+.timeBars {
+  display: flex;
+  align-items: end;
+  gap: 2px;
+  height: 58px;
+  padding: 6px 6px 4px;
+  border: 1px solid #e1e7ee;
+  border-radius: 7px;
+  background: linear-gradient(180deg, #ffffff, #f3f7f5);
+}
+
+.timeBars i {
+  flex: 1;
+  min-width: 2px;
+  border-radius: 3px 3px 1px 1px;
+  background: #d8e1dc;
+  transition: height 160ms ease;
+}
+
+.timeBars i.on {
+  background: #2f7a59;
+  box-shadow: 0 -2px 6px rgba(47, 122, 89, 0.28);
+}
+
+.tokenBars i.on {
+  background: #3b82f6;
+  box-shadow: 0 -2px 6px rgba(59, 130, 246, 0.28);
+}
+
+.successSplit {
+  display: flex;
+  height: 18px;
+  overflow: hidden;
+  border: 1px solid #d9e0e8;
+  border-radius: 999px;
+  background: #f1f5f9;
+}
+
+.successSplit i,
+.successSplit b {
+  display: block;
+  min-width: 0;
+}
+
+.successSplit i {
+  background: #22c55e;
+}
+
+.successSplit b {
+  background: #f87171;
+}
+
+.latencyCompare {
+  display: grid;
+  place-items: center;
+  gap: 6px;
+  min-height: 58px;
+  border: 1px solid #e1e7ee;
+  border-radius: 7px;
+  background: #ffffff;
+  text-align: center;
+}
+
+.latencyCompare span {
+  display: grid;
+  gap: 2px;
+}
+
+.latencyCompare small {
+  color: #7c8794;
+  font-size: 11px;
+}
+
+.latencyCompare strong {
+  font-size: 18px;
+}
+
+.latencyCompare b {
+  color: #6b7280;
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.latencyCompare b.good {
+  color: #15803d;
+}
+
+.latencyCompare b.bad {
+  color: #b91c1c;
+}
+
+@media (max-width: 1180px) {
+  .dashboardSummary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
 }
 
 .flowBoard {
@@ -657,6 +774,16 @@ code {
   gap: 8px;
 }
 
+.aggregateActions {
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
+.aggregateActions small {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
 .sectionControls button,
 .aggregateActions button,
 .diagnosticList button,
@@ -672,6 +799,15 @@ code {
 .dangerButton {
   border-color: #fecaca;
   color: #9f1239;
+}
+
+.dangerMiniButton {
+  border-color: #fecdd3 !important;
+  color: #be123c !important;
+}
+
+.dangerMiniButton:hover {
+  background: #fff1f2 !important;
 }
 
 .collapsedGrid .panel > :not(.sectionTitle) {
@@ -724,6 +860,35 @@ textarea:focus {
 .check input {
   width: 16px;
   height: 16px;
+}
+
+.capabilityEditor {
+  display: grid;
+  gap: 8px;
+}
+
+.capabilityEditor > span {
+  color: #4b554d;
+  font-size: 13px;
+  font-weight: 600;
+}
+
+.capabilityEditor > div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.capabilityEditor .check {
+  border: 1px solid #d9e0e8;
+  border-radius: 6px;
+  background: #ffffff;
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.compactCapabilityEditor {
+  margin-top: 8px;
 }
 
 .primary,
@@ -1384,6 +1549,51 @@ textarea:focus {
   margin-top: 0;
 }
 
+.unavailableItem {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 12px;
+  align-items: center;
+}
+
+.unavailableItem > div:first-child {
+  min-width: 0;
+}
+
+.unavailableItem strong,
+.unavailableItem span,
+.unavailableItem small {
+  display: block;
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+.unavailableActions {
+  justify-content: flex-end;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.unavailableActions button {
+  min-height: 32px;
+}
+
+.unavailableActions button:first-child {
+  width: auto;
+  min-width: 108px;
+  height: 32px;
+  gap: 6px;
+  padding: 0 12px;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
+.unavailableActions button:last-child {
+  width: 34px;
+  height: 32px;
+}
+
 .portEditor {
   display: grid;
   grid-template-columns: 100px 80px minmax(140px, 1fr) auto;
@@ -1463,5 +1673,13 @@ textarea:focus {
 
   .actions {
     justify-content: flex-end;
+  }
+
+  .metricTile {
+    grid-template-columns: minmax(90px, 0.8fr) minmax(120px, 1.2fr);
+  }
+
+  .unavailableItem {
+    grid-template-columns: 1fr;
   }
 }

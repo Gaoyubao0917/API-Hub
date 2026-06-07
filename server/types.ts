@@ -2,6 +2,8 @@ export type ProviderType = "openai-compatible" | "anthropic-compatible";
 
 export type KeyStatus = "unknown" | "healthy" | "unhealthy";
 
+export type ProviderCapability = "chat" | "responses" | "vision" | "image-generation" | "image-edit" | "files" | "audio";
+
 export type ApiKeyEntry = {
   id: string;
   label: string;
@@ -69,6 +71,7 @@ export type ModelSetting = {
   alias: string;
   strategy: ModelStrategy;
   routeId?: string;
+  capabilities?: ProviderCapability[];
   updatedAt: string;
 };
 

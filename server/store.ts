@@ -3,7 +3,10 @@ import fs from "node:fs";
 import path from "node:path";
 import { nanoid } from "nanoid";
 import { z } from "zod";
-import type { ApiKeyEntry, AppState, ClientApiKey, ModelRoute, ModelStrategy, Provider, PublicProvider, RequestLog, RouteFailureSource, SyncedModel } from "./types.js";
+import type { ApiKeyEntry, AppState, ClientApiKey, ModelRoute, ModelStrategy, Provider, ProviderCapability, PublicProvider, RequestLog, RouteFailureSource, SyncedModel } from "./types.js";
+
+export const allCapabilities: ProviderCapability[] = ["chat", "responses", "vision", "image-generation", "image-edit", "files", "audio"];
+export const defaultModelCapabilities: ProviderCapability[] = ["chat", "responses"];
 
 const providerSchema = z.object({
   name: z.string().trim().min(1),
@@ -159,6 +162,15 @@ export class Store {
     const state = this.all();
     state.routes = state.routes.filter((route) => route.id !== id);
     this.write(state);
+  }
+
+  deleteModelAlias(alias: string) {
+    const state = this.all();
+    const before = state.routes.length;
+    state.routes = state.routes.filter((route) => route.alias !== alias);
+    state.modelSettings = state.modelSettings.filter((setting) => setting.alias !== alias);
+    this.write(state);
+    return { deleted: before - state.routes.length };
   }
 
   addApiKeys(providerId: string, input: unknown): PublicProvider {
@@ -440,17 +452,19 @@ export class Store {
     }];
   }
 
-  updateModelSetting(alias: string, strategy: ModelStrategy, routeId?: string) {
+  updateModelSetting(alias: string, strategy: ModelStrategy, routeId?: string, capabilities?: ProviderCapability[]) {
     const state = this.all();
     const now = new Date().toISOString();
     const existing = state.modelSettings.find((item) => item.alias === alias);
     const selectedRouteId = strategy === "fixed" ? normalizeSelectedRouteId(state, alias, routeId) : undefined;
+    const nextCapabilities = capabilities ? normalizeCapabilities(capabilities) : undefined;
     if (existing) {
       existing.strategy = strategy;
       existing.routeId = selectedRouteId;
+      if (nextCapabilities) existing.capabilities = nextCapabilities;
       existing.updatedAt = now;
     } else {
-      state.modelSettings.push({ alias, strategy, routeId: selectedRouteId, updatedAt: now });
+      state.modelSettings.push({ alias, strategy, routeId: selectedRouteId, capabilities: nextCapabilities, updatedAt: now });
     }
     this.write(state);
     return this.publicState();
@@ -683,7 +697,10 @@ function normalizeState(state: AppState): AppState {
     }),
     routes,
     logs: state.logs ?? [],
-    modelSettings: (state.modelSettings ?? []).filter((setting) => aliases.has(setting.alias)),
+    modelSettings: (state.modelSettings ?? []).filter((setting) => aliases.has(setting.alias)).map((setting) => ({
+      ...setting,
+      capabilities: normalizeCapabilities(setting.capabilities)
+    })),
     settings: {
       port: Number(state.settings?.port ?? 3127),
       routeFailureThreshold: Math.max(1, Number(state.settings?.routeFailureThreshold ?? 1)),
@@ -691,6 +708,11 @@ function normalizeState(state: AppState): AppState {
       panelPassword: state.settings?.panelPassword ?? undefined
     }
   };
+}
+
+function normalizeCapabilities(capabilities?: ProviderCapability[]) {
+  const values = capabilities?.filter((capability): capability is ProviderCapability => allCapabilities.includes(capability)) ?? [];
+  return values.length > 0 ? [...new Set(values)] : [...defaultModelCapabilities];
 }
 
 function compareRoutes(strategy: ModelStrategy, state: AppState, left: ModelRoute, right: ModelRoute, routeId?: string) {

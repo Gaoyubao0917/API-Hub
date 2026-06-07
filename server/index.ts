@@ -3,7 +3,7 @@ import express from "express";
 import type { Server } from "node:http";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { Store } from "./store.js";
+import { defaultModelCapabilities, Store } from "./store.js";
 
 const dataDir = process.env.DATA_DIR ?? path.resolve(process.cwd(), "data");
 const envPanelPassword = process.env.PANEL_PASSWORD;
@@ -15,6 +15,8 @@ const routeCheckIntervalMs = Number(process.env.ROUTE_CHECK_INTERVAL_MS ?? 10 * 
 const recoverIntervalMs = Number(process.env.RECOVER_CHECK_INTERVAL_MS ?? 15 * 60 * 1000);
 const maxLoginAttempts = Number(process.env.LOGIN_MAX_ATTEMPTS ?? 5);
 const lockMinutes = Number(process.env.LOGIN_LOCK_MINUTES ?? 10);
+const jsonBodyLimit = process.env.JSON_BODY_LIMIT ?? "50mb";
+const uploadBodyLimitBytes = parseByteSize(process.env.UPLOAD_BODY_LIMIT ?? "200mb");
 const store = new Store(dataDir);
 const port = Number(process.env.PORT ?? store.all().settings.port ?? 3127);
 const app = express();
@@ -29,7 +31,7 @@ const SESSION_MAX_AGE = 24 * 60 * 60 * 1000;
 const sessions = new Map<string, { createdAt: number }>();
 const loginAttempts = new Map<string, { count: number; lockedUntil?: number }>();
 
-app.use(express.json({ limit: "10mb" }));
+app.use(express.json({ limit: jsonBodyLimit }));
 
 function parseCookies(req: express.Request): Record<string, string> {
   const cookies: Record<string, string> = {};
@@ -301,6 +303,15 @@ app.delete("/api/routes/:id", (req, res, next) => {
   }
 });
 
+app.delete("/api/models/:alias", (req, res, next) => {
+  try {
+    const alias = decodeURIComponent(req.params.alias);
+    res.json(store.deleteModelAlias(alias));
+  } catch (error) {
+    next(error);
+  }
+});
+
 app.post("/api/routes/cleanup-invalid", (_req, res, next) => {
   try {
     res.json(store.cleanupInvalidRoutes());
@@ -383,7 +394,8 @@ app.put("/api/model-settings/:alias", (req, res, next) => {
       return res.status(400).json({ error: "Invalid strategy" });
     }
     const routeId = typeof req.body?.routeId === "string" ? req.body.routeId : undefined;
-    res.json(store.updateModelSetting(req.params.alias, strategy as "fixed" | "fastest" | "priority" | "cost" | "random", routeId));
+    const capabilities = Array.isArray(req.body?.capabilities) ? req.body.capabilities : undefined;
+    res.json(store.updateModelSetting(req.params.alias, strategy as "fixed" | "fastest" | "priority" | "cost" | "random", routeId, capabilities));
   } catch (error) {
     next(error);
   }
@@ -492,6 +504,7 @@ app.get("/v1/models", (_req, res) => {
     object: "model",
     owned_by: [...meta.providers].join(", "),
     candidates: meta.candidateCount,
+    capabilities: state.modelSettings.find((setting) => setting.alias === id)?.capabilities ?? defaultModelCapabilities,
     best_latency_ms: meta.bestLatency
   }));
   res.json({ object: "list", data: routeModels });
@@ -624,8 +637,44 @@ app.post("/v1/images/generations", (req, res, next) => {
   proxyOpenAiEndpoint(req, res, next, "/images/generations", false).catch(next);
 });
 
+app.post("/v1/images/edits", (req, res, next) => {
+  proxyDefaultProviderEndpoint(req, res, "/images/edits").catch(next);
+});
+
+app.post("/v1/images/variations", (req, res, next) => {
+  proxyDefaultProviderEndpoint(req, res, "/images/variations").catch(next);
+});
+
+app.post("/v1/audio/transcriptions", (req, res, next) => {
+  proxyDefaultProviderEndpoint(req, res, "/audio/transcriptions").catch(next);
+});
+
+app.post("/v1/audio/translations", (req, res, next) => {
+  proxyDefaultProviderEndpoint(req, res, "/audio/translations").catch(next);
+});
+
 app.post("/v1/responses", (req, res, next) => {
   proxyOpenAiEndpoint(req, res, next, "/responses", Boolean(req.body?.stream)).catch(next);
+});
+
+app.get("/v1/files", (req, res, next) => {
+  proxyDefaultProviderEndpoint(req, res, getV1Endpoint(req)).catch(next);
+});
+
+app.post("/v1/files", (req, res, next) => {
+  proxyDefaultProviderEndpoint(req, res, "/files").catch(next);
+});
+
+app.get("/v1/files/:fileId", (req, res, next) => {
+  proxyDefaultProviderEndpoint(req, res, getV1Endpoint(req)).catch(next);
+});
+
+app.delete("/v1/files/:fileId", (req, res, next) => {
+  proxyDefaultProviderEndpoint(req, res, getV1Endpoint(req)).catch(next);
+});
+
+app.get("/v1/files/:fileId/content", (req, res, next) => {
+  proxyDefaultProviderEndpoint(req, res, getV1Endpoint(req)).catch(next);
 });
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -693,8 +742,7 @@ if (recoverIntervalMs > 0) {
 }
 
 function upstreamFetch(provider: { baseUrl: string }, apiKey: string, endpoint: string, init: RequestInit) {
-  const baseUrl = provider.baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
-  return fetch(`${baseUrl}/v1${endpoint}`, {
+  return fetch(upstreamUrl(provider, endpoint), {
     ...init,
     headers: {
       "content-type": "application/json",
@@ -702,6 +750,114 @@ function upstreamFetch(provider: { baseUrl: string }, apiKey: string, endpoint: 
       ...(init.headers ?? {})
     }
   });
+}
+
+function upstreamUrl(provider: { baseUrl: string }, endpoint: string) {
+  const baseUrl = provider.baseUrl.replace(/\/+$/, "").replace(/\/v1$/, "");
+  return `${baseUrl}/v1${endpoint}`;
+}
+
+async function proxyDefaultProviderEndpoint(req: express.Request, res: express.Response, endpoint: string) {
+  const candidate = chooseDefaultProviderCandidate();
+  if (!candidate) return res.status(400).json({ error: { message: "No enabled provider configured" } });
+  const started = Date.now();
+  const body = await readProxyBody(req);
+  const upstream = await fetch(upstreamUrl(candidate.provider, endpoint), {
+    method: req.method,
+    headers: buildPassthroughHeaders(req, candidate.key.value),
+    body,
+    signal: AbortSignal.timeout(candidate.provider.timeoutMs)
+  });
+  const latencyMs = Date.now() - started;
+  store.addLog({
+    model: endpoint,
+    providerId: candidate.provider.id,
+    providerName: candidate.provider.name,
+    upstreamModel: endpoint,
+    status: upstream.ok ? "success" : "failed",
+    statusCode: upstream.status,
+    latencyMs,
+    error: upstream.ok ? undefined : `HTTP ${upstream.status}`
+  });
+  await sendUpstreamResponse(upstream, res);
+}
+
+function chooseDefaultProviderCandidate() {
+  const providers = store.all().providers
+    .filter((provider) => provider.enabled && provider.apiKeys.some((key) => key.enabled))
+    .sort((left, right) => left.priority - right.priority);
+  for (const provider of providers) {
+    const key = chooseKey(provider);
+    if (key) return { provider, key };
+  }
+  return null;
+}
+
+async function readProxyBody(req: express.Request): Promise<BodyInit | undefined> {
+  if (req.method === "GET" || req.method === "HEAD") return undefined;
+  if (req.readableEnded && req.body !== undefined) {
+    return bufferToBody(Buffer.from(JSON.stringify(req.body)));
+  }
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    total += buffer.length;
+    if (total > uploadBodyLimitBytes) {
+      const error = new Error(`Request body too large; limit is ${uploadBodyLimitBytes} bytes`);
+      Object.assign(error, { statusCode: 413 });
+      throw error;
+    }
+    chunks.push(buffer);
+  }
+  return chunks.length > 0 ? bufferToBody(Buffer.concat(chunks)) : undefined;
+}
+
+function bufferToBody(buffer: Buffer): BodyInit {
+  return new Blob([new Uint8Array(buffer)]);
+}
+
+function buildPassthroughHeaders(req: express.Request, apiKey: string): HeadersInit {
+  const headers: Record<string, string> = {};
+  const blocked = new Set([
+    "authorization",
+    "connection",
+    "content-length",
+    "cookie",
+    "host",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade"
+  ]);
+  for (const [header, value] of Object.entries(req.headers)) {
+    const name = header.toLowerCase();
+    if (blocked.has(name) || value === undefined) continue;
+    headers[name] = Array.isArray(value) ? value.join(", ") : value;
+  }
+  headers.authorization = `Bearer ${apiKey}`;
+  return headers;
+}
+
+async function sendUpstreamResponse(upstream: Response, res: express.Response) {
+  res.status(upstream.status);
+  upstream.headers.forEach((value, header) => {
+    if (!["content-encoding", "content-length", "transfer-encoding"].includes(header.toLowerCase())) {
+      res.setHeader(header, value);
+    }
+  });
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
+  res.send(Buffer.from(await upstream.arrayBuffer()));
+}
+
+function getV1Endpoint(req: express.Request) {
+  return req.originalUrl.replace(/^\/v1/, "") || "/";
 }
 
 function chooseKey(provider: { apiKeys: { value: string; enabled: boolean; status: string; id: string }[] }) {
@@ -938,6 +1094,17 @@ async function safeJson(response: Response) {
   } catch {
     return null;
   }
+}
+
+function parseByteSize(value: string) {
+  const match = value.trim().toLowerCase().match(/^(\d+)(b|kb|mb|gb)?$/);
+  if (!match) return 200 * 1024 * 1024;
+  const amount = Number(match[1]);
+  const unit = match[2] ?? "b";
+  if (unit === "gb") return amount * 1024 * 1024 * 1024;
+  if (unit === "mb") return amount * 1024 * 1024;
+  if (unit === "kb") return amount * 1024;
+  return amount;
 }
 
 function parseUsage(body: unknown) {

@@ -23,6 +23,8 @@ type Provider = {
   lastSyncedAt?: string;
 };
 
+type ProviderCapability = "chat" | "responses" | "vision" | "image-generation" | "image-edit" | "files" | "audio";
+
 type PublicApiKey = {
   id: string;
   label: string;
@@ -65,7 +67,7 @@ type AppState = {
   providers: Provider[];
   routes: ModelRoute[];
   logs: RequestLog[];
-  modelSettings: { alias: string; strategy: ModelStrategy; routeId?: string }[];
+  modelSettings: { alias: string; strategy: ModelStrategy; routeId?: string; capabilities?: ProviderCapability[] }[];
   settings: { port: number; routeFailureThreshold: number; clientKeyCount: number };
 };
 
@@ -116,6 +118,16 @@ const emptyProvider: ProviderDraft = {
   timeoutMs: 60000,
   notes: ""
 };
+const defaultModelCapabilities: ProviderCapability[] = ["chat", "responses"];
+const capabilityOptions: { value: ProviderCapability; label: string }[] = [
+  { value: "chat", label: "文本/聊天" },
+  { value: "responses", label: "Responses" },
+  { value: "vision", label: "图片理解" },
+  { value: "image-generation", label: "图片生成" },
+  { value: "image-edit", label: "图片编辑" },
+  { value: "files", label: "文件上传" },
+  { value: "audio", label: "音频" }
+];
 const emptyRoute: RouteDraft = {
   alias: "",
   upstreamModel: "",
@@ -161,6 +173,7 @@ function App() {
   const [showQuickRoute, setShowQuickRoute] = useState(false);
   const [favoriteModels, setFavoriteModels] = useState<string[]>(() => readJson("api-hub-favorite-models", []));
   const [hiddenModels, setHiddenModels] = useState<string[]>(() => readJson("api-hub-hidden-models", []));
+  const [dashboardHiddenBefore, setDashboardHiddenBefore] = useState<string>(() => readJson("api-hub-dashboard-hidden-before", ""));
   const [showHiddenModels, setShowHiddenModels] = useState(false);
   const importInputRef = useRef<HTMLInputElement>(null);
 
@@ -174,16 +187,16 @@ function App() {
     const latencies = state.routes.map((route) => route.latencyMs).filter((latency): latency is number => typeof latency === "number");
     return latencies.length ? `${Math.min(...latencies)}ms` : "待检测";
   }, [state.routes]);
-  const successRate = useMemo(() => {
-    if (state.logs.length === 0) return "待统计";
-    return `${Math.round((state.logs.filter((log) => log.status === "success").length / state.logs.length) * 100)}%`;
-  }, [state.logs]);
-  const dashboardLogs = state.logs.slice(0, collapsed.dashboard ? previewLimit : 50);
-  const dashboardTotalTokens = useMemo(() => state.logs.reduce((sum, log) => sum + (log.totalTokens ?? 0), 0), [state.logs]);
-  const dashboardAvgLatency = useMemo(() => {
-    if (state.logs.length === 0) return "待统计";
-    return `${Math.round(state.logs.reduce((sum, log) => sum + log.latencyMs, 0) / state.logs.length)}ms`;
-  }, [state.logs]);
+  const visibleDashboardLogs = useMemo(() => {
+    const cutoff = dashboardHiddenBefore ? new Date(dashboardHiddenBefore).getTime() : 0;
+    if (!cutoff) return state.logs;
+    return state.logs.filter((log) => {
+      const created = new Date(log.createdAt).getTime();
+      return Number.isNaN(created) || created > cutoff;
+    });
+  }, [state.logs, dashboardHiddenBefore]);
+  const dashboardLogs = visibleDashboardLogs.slice(0, collapsed.dashboard ? previewLimit : 50);
+  const dashboardStats = useMemo(() => buildDashboardStats(state.logs), [state.logs]);
   const failureReasons = useMemo(() => {
     const counts = new Map<string, number>();
     for (const log of state.logs) {
@@ -525,6 +538,13 @@ function App() {
     await load();
   }
 
+  async function deleteAggregateModel(alias: string) {
+    if (!window.confirm(`删除聚合模型「${alias}」及其全部候选路由？`)) return;
+    const result = await request(`/api/models/${encodeURIComponent(alias)}`, { method: "DELETE" });
+    setStatus(`已删除聚合模型 ${alias}，共 ${result.deleted} 条候选路由`);
+    await load();
+  }
+
   async function exportConfig(includeSecrets: boolean) {
     const response = await fetch(`/api/config/export?includeSecrets=${includeSecrets}`, { credentials: "include" });
     if (!response.ok) {
@@ -614,16 +634,29 @@ function App() {
     await load();
   }
 
-  async function clearLogs() {
-    await request("/api/logs", { method: "DELETE" });
-    setStatus("调用看板已清空");
+  function hideDashboardLogs() {
+    const cutoff = new Date().toISOString();
+    setDashboardHiddenBefore(cutoff);
+    localStorage.setItem("api-hub-dashboard-hidden-before", JSON.stringify(cutoff));
+    setStatus("调用看板流水已隐藏，统计数据仍保留");
+  }
+
+  async function updateStrategy(alias: string, strategy: ModelStrategy, routeId?: string, capabilities = modelCapabilities(alias)) {
+    await request(`/api/model-settings/${encodeURIComponent(alias)}`, { method: "PUT", body: JSON.stringify({ strategy, routeId, capabilities }) });
+    setStatus(`模型 ${alias} 策略已更新`);
     await load();
   }
 
-  async function updateStrategy(alias: string, strategy: ModelStrategy, routeId?: string) {
-    await request(`/api/model-settings/${encodeURIComponent(alias)}`, { method: "PUT", body: JSON.stringify({ strategy, routeId }) });
-    setStatus(`模型 ${alias} 策略已更新`);
-    await load();
+  async function toggleModelCapability(alias: string, capability: ProviderCapability) {
+    const selected = new Set(modelCapabilities(alias));
+    if (selected.has(capability)) selected.delete(capability);
+    else selected.add(capability);
+    const setting = state.modelSettings.find((item) => item.alias === alias);
+    await updateStrategy(alias, setting?.strategy ?? "fixed", setting?.routeId, [...selected]);
+  }
+
+  function modelCapabilities(alias: string) {
+    return state.modelSettings.find((item) => item.alias === alias)?.capabilities ?? defaultModelCapabilities;
   }
 
   async function probeRoute(route: ModelRoute) {
@@ -745,16 +778,42 @@ function App() {
         <div className="sectionTitle">
           <h2>调用看板</h2>
           <div className="titleActions">
-            <span>最近 {dashboardLogs.length} 条链路</span>
-            <button className="iconButton" onClick={clearLogs}><Trash2 size={18} /></button>
+            <span>显示 {dashboardLogs.length} 条链路 · 统计保留 {state.logs.length} 条</span>
+            <button className="iconButton" title="隐藏当前流水，不删除统计数据" onClick={hideDashboardLogs}><Trash2 size={18} /></button>
             {sectionControls("dashboard")}
           </div>
         </div>
         <div className="dashboardSummary">
-          <div><span>请求总数</span><strong>{state.logs.length}</strong></div>
-          <div><span>成功率</span><strong>{successRate}</strong></div>
-          <div><span>平均延迟</span><strong>{dashboardAvgLatency}</strong></div>
-          <div><span>总 Token</span><strong>{dashboardTotalTokens || "未返回"}</strong></div>
+          <div className="metricTile chartMetric requestMetric">
+            <div className="metricMeta"><span>请求总数</span><strong>{dashboardStats.totalRequests}</strong><em>今日 {dashboardStats.todayRequests}</em></div>
+            <div className="timeBars" aria-label="今日每小时请求数">
+              {dashboardStats.requestSeries.map((value, index) => (
+                <i className={value > 0 ? "on" : ""} key={index} style={{ height: barHeight(value, dashboardStats.maxRequests) }} title={`${index}:00 ${value} 次`} />
+              ))}
+            </div>
+          </div>
+          <div className="metricTile successMetric">
+            <div className="metricMeta"><span>成功率</span><strong>{dashboardStats.successRateText}</strong><em>失败 {dashboardStats.failedRequests}</em></div>
+            <div className="successSplit" aria-label={`成功率 ${dashboardStats.successRateText}`}>
+              <i style={{ width: `${dashboardStats.successPercent}%` }} />
+              <b style={{ width: `${100 - dashboardStats.successPercent}%` }} />
+            </div>
+          </div>
+          <div className="metricTile latencyMetric">
+            <div className="metricMeta"><span>平均延迟</span><strong>{formatMs(dashboardStats.todayAvgLatency)}</strong><em>今日</em></div>
+            <div className="latencyCompare" aria-label="今日与昨日平均延迟对比">
+              <span><small>昨日</small><strong>{formatMs(dashboardStats.yesterdayAvgLatency)}</strong></span>
+              <b className={dashboardStats.latencyDelta === null ? "" : dashboardStats.latencyDelta <= 0 ? "good" : "bad"}>{formatDeltaMs(dashboardStats.latencyDelta)}</b>
+            </div>
+          </div>
+          <div className="metricTile chartMetric tokenMetric">
+            <div className="metricMeta"><span>总 Token</span><strong>{dashboardStats.totalTokens || "未返回"}</strong><em>今日 {dashboardStats.todayTokens || 0}</em></div>
+            <div className="timeBars tokenBars" aria-label="今日每小时 Token">
+              {dashboardStats.tokenSeries.map((value, index) => (
+                <i className={value > 0 ? "on" : ""} key={index} style={{ height: barHeight(value, dashboardStats.maxTokens) }} title={`${index}:00 ${value} tokens`} />
+              ))}
+            </div>
+          </div>
         </div>
         {!collapsed.dashboard && (
           <div className="dashboardInsights">
@@ -804,6 +863,7 @@ function App() {
             const strategy = setting?.strategy ?? "fixed";
             const enabledCandidates = routes.filter((route) => route.enabled);
             const selectedRouteId = setting?.routeId && enabledCandidates.some((route) => route.id === setting.routeId) ? setting.routeId : enabledCandidates[0]?.id ?? "";
+            const capabilities = modelCapabilities(alias);
             return (
             <article className="aggregateItem" key={alias}>
               <div>
@@ -811,6 +871,7 @@ function App() {
                 <div className="aggregateActions">
                   <small>{routes.length} 候选 · {enabledCount} 启用 · {healthyCount} 正常{avgLatency !== null ? ` · 均${avgLatency}ms · 快${bestLatency}ms` : ""}</small>
                   <button onClick={() => probeAlias(alias)}>检测全部</button>
+                  <button className="dangerMiniButton" title="删除聚合模型" onClick={() => deleteAggregateModel(alias)}><Trash2 size={13} />删除</button>
                 </div>
               </div>
               <select value={strategy} onChange={(event) => updateStrategy(alias, event.target.value as ModelStrategy, selectedRouteId)}>
@@ -829,6 +890,17 @@ function App() {
                   })}
                 </select>
               )}
+              <div className="capabilityEditor compactCapabilityEditor">
+                <span>模型能力</span>
+                <div>
+                  {capabilityOptions.map((item) => (
+                    <label className="check" key={item.value}>
+                      <input checked={capabilities.includes(item.value)} onChange={() => toggleModelCapability(alias, item.value)} type="checkbox" />
+                      {item.label}
+                    </label>
+                  ))}
+                </div>
+              </div>
               <div className="candidateList">
                 {routes.sort((left, right) => (left.latencyMs ?? Number.MAX_SAFE_INTEGER) - (right.latencyMs ?? Number.MAX_SAFE_INTEGER)).map((route) => {
                   const provider = state.providers.find((item) => item.id === route.providerId);
@@ -1103,13 +1175,13 @@ function App() {
                   const provider = state.providers.find((item) => item.id === route.providerId);
                   const failedAt = route.lastFailedAt ?? route.lastCheckedAt;
                   return (
-                    <article className="item" key={route.id}>
+                    <article className="item unavailableItem" key={route.id}>
                       <div>
                         <strong>{provider?.name ?? "未知供应商"} / {route.upstreamModel}</strong>
                         <span>{route.disabledReason ?? route.lastError ?? "不可调用"}</span>
                         <small>{failureSourceLabel(route.failureSource)} · 失败 {route.failureCount ?? 0} 次 · {failedAt ? formatDateTime(failedAt) : "暂无检测时间"}</small>
                       </div>
-                      <div className="actions">
+                      <div className="actions unavailableActions">
                         <button onClick={() => recoverRoute(route)}><RefreshCw size={17} />检测恢复</button>
                         <button onClick={() => remove(`/api/routes/${route.id}`)}><Trash2 size={17} /></button>
                       </div>
@@ -1234,6 +1306,82 @@ function costTierLabel(tier?: "low" | "medium" | "high") {
   if (tier === "low") return "低";
   if (tier === "high") return "高";
   return "中";
+}
+
+function buildDashboardStats(logs: RequestLog[]) {
+  const requestSeries = Array(24).fill(0) as number[];
+  const tokenSeries = Array(24).fill(0) as number[];
+  const today = startOfLocalDay(0);
+  const tomorrow = startOfLocalDay(1);
+  const yesterday = startOfLocalDay(-1);
+  let todayLatencyTotal = 0;
+  let todayLatencyCount = 0;
+  let yesterdayLatencyTotal = 0;
+  let yesterdayLatencyCount = 0;
+  let todayRequests = 0;
+  let todayTokens = 0;
+  let totalTokens = 0;
+  let successCount = 0;
+
+  for (const log of logs) {
+    if (log.status === "success") successCount += 1;
+    totalTokens += log.totalTokens ?? 0;
+    const date = new Date(log.createdAt);
+    if (Number.isNaN(date.getTime())) continue;
+    if (date >= today && date < tomorrow) {
+      const hour = date.getHours();
+      requestSeries[hour] += 1;
+      tokenSeries[hour] += log.totalTokens ?? 0;
+      todayTokens += log.totalTokens ?? 0;
+      todayRequests += 1;
+      todayLatencyTotal += log.latencyMs;
+      todayLatencyCount += 1;
+    } else if (date >= yesterday && date < today) {
+      yesterdayLatencyTotal += log.latencyMs;
+      yesterdayLatencyCount += 1;
+    }
+  }
+
+  const todayAvgLatency = todayLatencyCount > 0 ? Math.round(todayLatencyTotal / todayLatencyCount) : null;
+  const yesterdayAvgLatency = yesterdayLatencyCount > 0 ? Math.round(yesterdayLatencyTotal / yesterdayLatencyCount) : null;
+  return {
+    totalRequests: logs.length,
+    todayRequests,
+    failedRequests: logs.length - successCount,
+    successPercent: logs.length > 0 ? Math.round((successCount / logs.length) * 100) : 0,
+    successRateText: logs.length > 0 ? `${Math.round((successCount / logs.length) * 100)}%` : "待统计",
+    requestSeries,
+    tokenSeries,
+    maxRequests: Math.max(1, ...requestSeries),
+    maxTokens: Math.max(1, ...tokenSeries),
+    totalTokens,
+    todayTokens,
+    todayAvgLatency,
+    yesterdayAvgLatency,
+    latencyDelta: todayAvgLatency !== null && yesterdayAvgLatency !== null ? todayAvgLatency - yesterdayAvgLatency : null
+  };
+}
+
+function startOfLocalDay(offset: number) {
+  const date = new Date();
+  date.setHours(0, 0, 0, 0);
+  date.setDate(date.getDate() + offset);
+  return date;
+}
+
+function barHeight(value: number, max: number) {
+  if (value <= 0) return "4px";
+  return `${Math.max(10, Math.round((value / max) * 100))}%`;
+}
+
+function formatMs(value: number | null) {
+  return value === null ? "暂无" : `${value}ms`;
+}
+
+function formatDeltaMs(value: number | null) {
+  if (value === null) return "无对比";
+  if (value === 0) return "持平";
+  return `${value > 0 ? "+" : ""}${value}ms`;
 }
 
 function readJson<T>(key: string, fallback: T): T {
